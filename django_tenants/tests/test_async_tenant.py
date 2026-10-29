@@ -8,7 +8,7 @@ These tests verify that:
 """
 import asyncio
 
-from django.db import connection
+from django.db import connection, connections
 from django.test.utils import override_settings
 
 from dts_test_app.models import DummyModel
@@ -37,12 +37,23 @@ class AsyncTenantResolutionTest(TenantTestCase):
         await DummyModel.objects.aget(...) inside a tenant context must resolve
         the tenant's schema, not public. DummyModel only exists in tenant
         schemas, so a public-only search_path would make the query fail.
+
+        The ORM calls run on asgiref's executor thread, which has its own DB
+        connection that cannot see rows created inside the TestCase's
+        uncommitted transaction on the main thread's connection. The row is
+        therefore created and removed on the executor thread's connection
+        (autocommitted), so the aget actually finds it.
         """
-        with tenant_context(self.tenant):
-            DummyModel.objects.create(name="async-tenant-row")
+        # Clean up any residue from a previous crashed run (committed data is
+        # visible here).
+        DummyModel.objects.filter(name="async-tenant-row").delete()
 
         async def query():
-            return await DummyModel.objects.aget(name="async-tenant-row")
+            await DummyModel.objects.acreate(name="async-tenant-row")
+            try:
+                return await DummyModel.objects.aget(name="async-tenant-row")
+            finally:
+                await DummyModel.objects.filter(name="async-tenant-row").adelete()
 
         with tenant_context(self.tenant):
             obj = asyncio.run(query())
@@ -174,8 +185,12 @@ class LimitSetCallsTest(TenantTestCase):
         # ContextVars say the tenant's schema...
         connection.set_tenant(self.tenant)
         # ...but this instance's cache pretends a previous request had
-        # selected public.
-        stale_wrapper = connection.__class__(connection.settings_dict, alias=connection.alias)
+        # selected public. Note: connections["default"] is the real
+        # DatabaseWrapper -- django.db.connection is a proxy, so
+        # connection.__class__ would give the proxy class, not the wrapper.
+        stale_wrapper = connections["default"].__class__(
+            connections["default"].settings_dict, alias=connections["default"].alias
+        )
         self.addCleanup(stale_wrapper.close)
         stale_wrapper.search_path_set_schemas = [get_public_schema_name()]
 
@@ -192,7 +207,10 @@ class PerAliasStateTest(TenantTestCase):
     """
 
     def test_set_tenant_is_isolated_per_alias(self):
-        replica = connection.__class__(connection.settings_dict, alias="replica")
+        # connections["default"] is the real DatabaseWrapper; django.db.connection
+        # is a proxy, so connection.__class__ would give the proxy class.
+        default_wrapper = connections["default"]
+        replica = default_wrapper.__class__(default_wrapper.settings_dict, alias="replica")
         self.addCleanup(replica.close)
 
         connection.set_tenant(self.tenant)
