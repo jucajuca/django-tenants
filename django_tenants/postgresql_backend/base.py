@@ -1,6 +1,7 @@
 import contextvars
 import re
 import warnings
+from types import MappingProxyType
 from django.conf import settings
 from importlib import import_module
 
@@ -56,17 +57,59 @@ def _check_schema_name(name):
         raise ValidationError("Invalid string used for the schema name.")
 
 
-# Per-request tenant state. django-bolt (and async stacks generally) spread
+# Per-request tenant state. Async stacks (including ASGI servers) spread
 # database work across multiple threads, so thread-local instance attributes
 # cannot reach the thread that actually runs a query. ContextVars propagate
 # across those threads (asgiref copies/restores the context at sync<->async
 # boundaries), so the currently selected tenant is carried per-request without
 # leaking between concurrent requests.
-_TENANT_CONTEXTVAR = contextvars.ContextVar("django_tenants.tenant", default=None)
-_SCHEMA_NAME_CONTEXTVAR = contextvars.ContextVar("django_tenants.schema_name", default=None)
-_INCLUDE_PUBLIC_SCHEMA_CONTEXTVAR = contextvars.ContextVar(
-    "django_tenants.include_public_schema", default=True
+#
+# The state is stored per-database-alias to support multiple database connections
+# (e.g., read replicas) where each alias can have a different tenant active.
+#
+# IMPORTANT: the value held by _TENANT_STATE_CONTEXTVAR must be treated as
+# immutable. A copied context shares the same object by reference, so mutating
+# the dict in place would leak tenant state into every other context that
+# copied it (concurrent requests/tasks). All writes go through _set_tenant_state,
+# which copies the dict (copy-on-write) and publishes the new dict via .set().
+# MappingProxyType enforces read-only access: an accidental mutation by
+# external code raises TypeError instead of corrupting the defaults for every
+# uninitialized alias.
+_DEFAULT_TENANT_STATE = MappingProxyType({
+    "tenant": None,
+    "schema_name": None,
+    "include_public_schema": True,
+})
+
+_TENANT_STATE_CONTEXTVAR = contextvars.ContextVar(
+    "django_tenants.tenant_state",
+    default=None,  # Immutable dict keyed by alias:
+                   # {"default": {"tenant": ..., "schema_name": ..., "include_public_schema": ...}, ...}
 )
+
+
+def _get_tenant_state(alias):
+    """Get tenant state dict for a specific database alias (read-only)."""
+    all_states = _TENANT_STATE_CONTEXTVAR.get()
+    if all_states is None:
+        return _DEFAULT_TENANT_STATE
+    return all_states.get(alias, _DEFAULT_TENANT_STATE)
+
+
+def _set_tenant_state(alias, key, value):
+    """
+    Set a specific key in the tenant state for an alias.
+
+    Copy-on-write: publishes a NEW dict via .set() rather than mutating the
+    existing one, so other contexts that copied the current dict keep their
+    own state (concurrent requests/tasks stay isolated).
+    """
+    all_states = _TENANT_STATE_CONTEXTVAR.get()
+    new_states = dict(all_states) if all_states is not None else {}
+    alias_state = dict(new_states.get(alias, _DEFAULT_TENANT_STATE))
+    alias_state[key] = value
+    new_states[alias] = alias_state
+    _TENANT_STATE_CONTEXTVAR.set(new_states)
 
 
 class DatabaseWrapper(original_backend.DatabaseWrapper):
@@ -78,27 +121,27 @@ class DatabaseWrapper(original_backend.DatabaseWrapper):
 
     @property
     def include_public_schema(self):
-        return _INCLUDE_PUBLIC_SCHEMA_CONTEXTVAR.get()
+        return _get_tenant_state(self.alias)["include_public_schema"]
 
     @include_public_schema.setter
     def include_public_schema(self, value):
-        _INCLUDE_PUBLIC_SCHEMA_CONTEXTVAR.set(value)
+        _set_tenant_state(self.alias, "include_public_schema", value)
 
     @property
     def tenant(self):
-        return _TENANT_CONTEXTVAR.get()
+        return _get_tenant_state(self.alias)["tenant"]
 
     @tenant.setter
     def tenant(self, value):
-        _TENANT_CONTEXTVAR.set(value)
+        _set_tenant_state(self.alias, "tenant", value)
 
     @property
     def schema_name(self):
-        return _SCHEMA_NAME_CONTEXTVAR.get()
+        return _get_tenant_state(self.alias)["schema_name"]
 
     @schema_name.setter
     def schema_name(self, value):
-        _SCHEMA_NAME_CONTEXTVAR.set(value)
+        _set_tenant_state(self.alias, "schema_name", value)
 
     def __init__(self, *args, **kwargs):
         self.search_path_set_schemas = None
@@ -238,16 +281,21 @@ class DatabaseWrapper(original_backend.DatabaseWrapper):
         if self._setting_search_path:
             return
 
-        # optionally limit the number of executions - under load, the execution
-        # of `set search_path` can be quite time consuming
-        if get_limit_set_calls() and self.search_path_set_schemas:
-            return
-
         if not self.schema_name:
             raise ImproperlyConfigured("Database schema not set. Did you forget "
                                        "to call set_schema() or set_tenant()?")
 
         search_paths = self._get_cursor_search_paths()
+
+        # optionally limit the number of executions - under load, the execution
+        # of `set search_path` can be quite time consuming.
+        # Compare the cached paths against the ones the current tenant state
+        # produces, rather than just checking that the cache is filled in: the
+        # tenant can have changed in the meantime (e.g. via the contextvars from
+        # another thread of the same request) while this connection instance
+        # still holds a stale cache from a previous tenant.
+        if get_limit_set_calls() and self.search_path_set_schemas == search_paths:
+            return
 
         self._setting_search_path = True
         cursor_for_search_path = self.connection.cursor() if cursor is None else cursor
