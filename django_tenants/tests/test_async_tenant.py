@@ -49,6 +49,40 @@ class AsyncTenantResolutionTest(TenantTestCase):
 
         self.assertEqual(obj.name, "async-tenant-row")
 
+    def test_db_work_on_executor_thread_resolves_tenant_schema(self):
+        """
+        ``sync_to_async(thread_sensitive=False)`` runs DB work on a threadpool
+        thread with its own thread-local ``DatabaseWrapper``. The ContextVar
+        state must reach that thread, and the ``SET search_path`` must be
+        issued on that thread's own session -- otherwise the query would run
+        against public, which is exactly the failure the middleware approach
+        could not fix.
+        """
+        from asgiref.sync import sync_to_async
+
+        async def probe():
+            @sync_to_async
+            def _on_executor_thread():
+                # This runs on a threadpool thread: the thread-local wrapper
+                # for THIS thread is resolved from the ContextVars.
+                schema = connection.schema_name
+                cursor = connection.cursor()
+                search_path = _current_search_path(cursor)
+                cursor.close()
+                # Don't linger on the executor thread's session.
+                connection.close()
+                return schema, search_path
+
+            return await _on_executor_thread()
+
+        with tenant_context(self.tenant):
+            schema, search_path = asyncio.run(probe())
+
+        # The threadpool thread's own connection was scoped to the tenant...
+        self.assertEqual(schema, self.tenant.schema_name)
+        # ...and its SET search_path was issued there too.
+        self.assertEqual(search_path, self.tenant.schema_name)
+
     def _assert_task_state_isolation(self):
         """
         A task that changes the tenant must see its own change, and the change
